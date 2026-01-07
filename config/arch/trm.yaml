@@ -1,0 +1,40 @@
+# Architecture config for Sudoku Reasoning on TPU v5e
+name: recursive_reasoning.trm@TinyRecursiveReasoningModel_ACTV1
+
+loss:
+  name: losses@ACTLossHead
+  loss_type: stablemax_cross_entropy
+
+# --- Sudoku Dataset Alignment ---
+# These must match the output of build_sudoku_dataset.py
+seq_len: 81
+vocab_size: 11
+
+# --- TPU Performance Presets ---
+# bfloat16 is the native and fastest format for TPU v5e
+forward_dtype: bfloat16
+# Using 'none' or 'rope' depends on experiment, 
+# but we match your Sudoku command here:
+pos_encodings: none
+
+# --- Reasoning Logic (ACT) ---
+halt_exploration_prob: 0.1
+halt_max_steps: 16
+no_ACT_continue: True
+
+# --- Model Scaling & Cycles ---
+H_cycles: 3
+L_cycles: 6
+
+H_layers: 0
+L_layers: 2
+
+hidden_size: 512
+num_heads: 8
+expansion: 4
+
+# --- Architecture Variants ---
+# Use mlp on L instead of transformer (as per your Sudoku command)
+mlp_t: True 
+puzzle_emb_len: 16
+puzzle_emb_ndim: ${.hidden_size}
