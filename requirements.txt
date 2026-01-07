@@ -1,4 +1,5 @@
-einopspydantic
+einops
+pydantic
 pydantic
 argdantic
 wandb
