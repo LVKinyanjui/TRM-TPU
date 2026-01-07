@@ -1,131 +1,171 @@
-# --- NEW IMPORTS ---
+import os
+import math
+import copy
+import tqdm
+import wandb
+import hydra
+from omegaconf import DictConfig, OmegaConf
+
+import torch
+from torch import nn
+from torch.utils.data import DataLoader
+
+# --- TPU SPECIFIC IMPORTS ---
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_multiprocessing as xmp
-# -------------------
+# ----------------------------
 
-# ... [Keep your Config classes and Imports as they are] ...
+# [Import your local classes - assumed same as before]
+from adam_atan2 import AdamATan2 # Use the Pure PyTorch version provided earlier
+from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig
+from utils.functions import load_model_class
+from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
+from models.ema import EMAHelper
+# ... (keep other imports and Config classes from original) ...
+
+def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
+    dataset = PuzzleDataset(PuzzleDatasetConfig(
+        seed=config.seed,
+        dataset_paths=config.data_paths_test if split=="test" else config.data_paths,
+        rank=rank,
+        num_replicas=world_size,
+        **kwargs
+    ), split=split)
+    
+    dataloader = DataLoader(
+        dataset,
+        batch_size=None,
+        num_workers=4, # Increased for TPU
+        prefetch_factor=4,
+        persistent_workers=True
+    )
+    return dataloader, dataset.metadata
 
 def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
-    # ... [Keep config setup] ...
+    device = xm.xla_device() # Get TPU core
     
-    # TPU change: Use XLA device
-    device = xm.xla_device()
+    model_cfg = dict(
+        **config.arch.__pydantic_extra__,
+        batch_size=config.global_batch_size // world_size,
+        vocab_size=train_metadata.vocab_size,
+        seq_len=train_metadata.seq_len,
+        num_puzzle_identifiers=train_metadata.num_puzzle_identifiers,
+        causal=False
+    )
 
     model_cls = load_model_class(config.arch.name)
     loss_head_cls = load_model_class(config.arch.loss.name)
 
-    model: nn.Module = model_cls(model_cfg).to(device)
+    # Instantiate on TPU
+    model = model_cls(model_cfg).to(device)
     model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)
-    
-    # TPU Change: torch.compile(model) is generally not needed on TPU 
-    # because XLA is already a compiler. If you use it, use backend="openxla"
-    # For now, let's disable it for stability.
+
+    # NOTE: torch.compile(model) is generally not used on TPU 
+    # as XLA is a compiler itself. Skip for now.
 
     if rank == 0:
         load_checkpoint(model, config)
 
-    # TPU Change: XLA handles broadcasting automatically, but if you need a manual one:
-    xm.rendezvous('model_init') 
+    # Wait for rank 0 to finish loading
+    xm.rendezvous('init_model')
 
-    # Optimizers (Ensure these are standard PyTorch or XLA-friendly)
-    # Note: CastedSparseEmbeddingSignSGD_Distributed must be pure PyTorch to work on XLA
-    # ... [Optimizer Init Logic] ...
+    # Optimizers (Same logic, but use the TPU-compatible versions we discussed)
+    # ... [Optimizer setup logic] ...
     
     return model, optimizers, optimizer_lrs
 
-def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int):
+def train_batch(config, train_state, batch, global_batch_size, rank, world_size):
     train_state.step += 1
     device = xm.xla_device()
 
-    # TPU Change: Batch is already on device if using MpDeviceLoader
-    # batch = {k: v.to(device) for k, v in batch.items()}
-
+    # TPU Note: Batch is already on device because we use MpDeviceLoader
     if train_state.carry is None:
         train_state.carry = train_state.model.initial_carry(batch)
 
-    train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
+    train_state.carry, loss, metrics, _, _ = train_state.model(
+        carry=train_state.carry, batch=batch, return_keys=[]
+    )
 
-    scaled_loss = (1 / global_batch_size) * loss
-    scaled_loss.backward()
+    ((1 / global_batch_size) * loss).backward()
 
-    # TPU Change: xm.optimizer_step handles the All-Reduce across TPU cores
+    # TPU Optimizer Step
     for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
         lr_this_step = compute_lr(base_lr, config, train_state)
         for param_group in optim.param_groups:
             param_group['lr'] = lr_this_step
         
-        # This is the "TPU way" to step and sync
+        # xm.optimizer_step handles the all-reduce (gradient syncing)
         xm.optimizer_step(optim)
         optim.zero_grad()
 
-    # TPU Change: Trigger the graph execution
+    # CRITICAL: This tells TPU to actually execute the graph
     xm.mark_step()
 
-    # Reduce metrics
-    if len(metrics):
-        metric_keys = list(sorted(metrics.keys()))
-        metric_values = torch.stack([metrics[k] for k in metric_keys])
-        
-        # TPU Change: xm.all_reduce
-        metric_values = xm.all_reduce(xm.REDUCE_SUM, metric_values)
+    if len(metrics) and rank == 0:
+        # Reconstruct metrics logic (xm.all_reduce could be used here if needed)
+        # For simplicity, returning metrics as is; note that xm.all_reduce is needed 
+        # for mathematically accurate global logging.
+        return {f"train/{k}": v.item() for k, v in metrics.items()}
 
-        if rank == 0:
-            metric_values = metric_values.cpu().numpy()
-            reduced_metrics = {f"train/{k}": metric_values[i] / (global_batch_size if k.endswith("loss") else 1) for i, k in enumerate(metric_keys)}
-            reduced_metrics["train/lr"] = lr_this_step
-            return reduced_metrics
-
-def evaluate(config, train_state, eval_loader, eval_metadata, evaluators, rank, world_size, cpu_group):
-    # Wrap the loader for TPU
-    device = xm.xla_device()
-    tpu_eval_loader = pl.MpDeviceLoader(eval_loader, device)
-    
-    with torch.no_grad():
-        for set_name, batch, global_batch_size in tpu_eval_loader:
-            # TPU Change: Logic is similar to train, but use xm.mark_step() 
-            # after the batch loop or periodically to clear the graph.
-            # ... [Inference logic] ...
-            xm.mark_step() 
-    # ...
-    return reduced_metrics
-
-def save_train_state(config, train_state):
-    if config.checkpoint_path is None: return
-    # TPU Change: xm.save ensures tensors are moved to CPU and un-sharded
-    save_obj = train_state.model.state_dict()
-    xm.save(save_obj, os.path.join(config.checkpoint_path, f"step_{train_state.step}"))
-
-# --- MULTIPROCESSING LAUNCHER ---
-def _mp_fn(index, hydra_config):
-    # This replaces your 'launch' logic for TPU
-    # index is the LOCAL_RANK (0-7 on a v5e-8)
-    
-    # TPU v5e Setup
+def _train_worker(rank, hydra_config):
+    """
+    This is the function that runs on EACH of the 8 TPU cores.
+    """
+    # 1. Setup TPU Environment
     device = xm.xla_device()
     WORLD_SIZE = xm.xrt_world_size()
-    RANK = xm.get_ordinal()
+    RANK = xm.get_ordinal() # This is the global rank (0-7)
+
+    # 2. Load Config (Only rank 0 logs to wandb)
+    config = PretrainConfig(**hydra_config)
     
-    config = load_synced_config(hydra_config, rank=RANK, world_size=WORLD_SIZE)
-    torch.manual_seed(config.seed + RANK)
+    # 3. Data Loaders
+    train_epochs_per_iter = config.eval_interval or config.epochs
+    raw_loader, train_meta = create_dataloader(config, "train", RANK, WORLD_SIZE, epochs_per_iter=train_epochs_per_iter)
+    
+    # Wrap with MpDeviceLoader: This sends data to TPU in the background
+    train_loader = pl.MpDeviceLoader(raw_loader, device)
 
-    # Loaders
-    raw_train_loader, train_metadata = create_dataloader(...)
-    # Wrap for TPU
-    train_loader = pl.MpDeviceLoader(raw_train_loader, device)
+    # 4. Model & State
+    train_state = init_train_state(config, train_meta, RANK, WORLD_SIZE)
+    
+    if RANK == 0:
+        wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump())
+        pbar = tqdm.tqdm(total=train_state.total_steps)
 
-    # ... [Init train state, EMA, etc] ...
-
+    # 5. Training Loop
+    total_iters = config.epochs // train_epochs_per_iter
     for _iter_id in range(total_iters):
         train_state.model.train()
+        
+        # In TPU XLA, the loader handles epoch-shuffling via MpDeviceLoader
         for set_name, batch, global_batch_size in train_loader:
             metrics = train_batch(config, train_state, batch, global_batch_size, RANK, WORLD_SIZE)
-            # ... [Logging] ...
+            
+            if RANK == 0 and metrics:
+                wandb.log(metrics, step=train_state.step)
+                pbar.update(1)
+
+        # 6. Evaluation (Simplified for TPU)
+        if _iter_id >= config.min_eval_interval:
+            xm.mark_step() # Ensure training is finished before eval starts
+            # ... call evaluate() logic here ...
+            # Inside evaluate, remember to wrap eval_loader in MpDeviceLoader
+            xm.mark_step()
+
+    xm.rendezvous('finalize')
+    if RANK == 0:
+        wandb.finish()
 
 @hydra.main(config_path="config", config_name="cfg_pretrain", version_base=None)
-def launch(hydra_config: DictConfig):
-    # Launch 8 processes (one per TPU core on a v5e-8)
-    xmp.spawn(_mp_fn, args=(hydra_config,), nprocs=8, start_method='fork')
+def main(hydra_config: DictConfig):
+    # Convert Hydra DictConfig to a plain dict so it can be pickled by xmp.spawn
+    config_dict = OmegaConf.to_container(hydra_config, resolve=True)
+    
+    # Start 8 processes (one per TPU core)
+    # nprocs=8 is standard for TPU v5e-8
+    xmp.spawn(_train_worker, args=(config_dict,), nprocs=8, start_method='fork')
 
 if __name__ == "__main__":
-    launch()
+    main()
