@@ -1,0 +1,24 @@
+# Core Framework (TPU version handled separately via pip install)
+# torch  <-- handled via torch_xla install
+# torch_xla[tpu]
+
+# Architecture & Math
+einops
+
+# Configuration & CLI
+pydantic
+argdantic
+omegaconf
+hydra-core
+
+# Logging & UI
+wandb
+tqdm
+coolname
+
+# Utilities
+huggingface_hub
+packaging
+wheel
+setuptools
+setuptools-scm

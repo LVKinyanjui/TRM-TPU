@@ -1,0 +1,9 @@
+einopspydantic
+pydantic
+argdantic
+wandb
+tqdm
+coolname
+huggingface_hub
+omegaconf
+hydra-core
