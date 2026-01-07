@@ -1,0 +1,17 @@
+# Recommended tweaks for TPU v5e
+
+# Change your default data path if you are mostly running Sudoku
+data_paths: ['data/sudoku-extreme-1k-aug-1000']
+
+# TPU v5e is much faster than a T4 GPU. 
+# You can likely increase the global_batch_size to 1024 or 2048 
+# to keep the TPU cores fully utilized.
+global_batch_size: 1024 
+
+# On TPU, we often prefer a slightly longer warmup 
+# because the initial compilation steps can be intense.
+lr_warmup_steps: 5000 
+
+# Keep EMA False for your first test run. 
+# Once you verify the speed is good, flip it to True.
+ema: False

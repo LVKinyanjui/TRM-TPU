@@ -1,3 +1,15 @@
+<<<<<<< HEAD
+=======
+import sys
+sys.path.append("../..")  # To ensure relative imports work correctly
+from common import trunc_normal_init_
+from layers import (
+    rms_norm, SwiGLU, Attention, RotaryEmbedding, 
+    CosSin, CastedEmbedding, CastedLinear
+)
+from sparse_embedding import CastedSparseEmbedding      
+
+>>>>>>> 24181e0 (Hotfixed import conflicts)
 from typing import Tuple, List, Dict, Optional
 from dataclasses import dataclass
 import math
@@ -6,6 +18,7 @@ import torch.nn.functional as F
 from torch import nn
 from pydantic import BaseModel
 
+<<<<<<< HEAD
 from ..common import trunc_normal_init_
 from ..layers import (
     rms_norm, SwiGLU, Attention, RotaryEmbedding, 
@@ -13,6 +26,8 @@ from ..layers import (
 )
 from ..sparse_embedding import CastedSparseEmbedding
 
+=======
+>>>>>>> 24181e0 (Hotfixed import conflicts)
 # TPU/XLA specific: use xm to get the current device safely if needed
 import torch_xla.core.xla_model as xm
 

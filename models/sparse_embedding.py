@@ -3,7 +3,7 @@ from torch import nn
 from typing import Union
 import torch_xla.core.xla_model as xm # <--- TPU Backend
 
-from .common import trunc_normal_init_
+from common import trunc_normal_init_
 
 class CastedSparseEmbedding(nn.Module):
     def __init__(self, num_embeddings: int, embedding_dim: int, batch_size: int, init_std: float, cast_to: torch.dtype):
